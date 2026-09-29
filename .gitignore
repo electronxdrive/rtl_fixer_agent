@@ -1,0 +1,18 @@
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+openai_key.txt
+*_key.txt
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Generated experiment outputs and Chroma databases
+results/
+*.sqlite3
+*.sqlite3-*
