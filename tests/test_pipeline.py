@@ -41,6 +41,56 @@ class PipelineTests(unittest.TestCase):
     def test_unscored_tasks_are_not_dropped(self):
         self.assertEqual(run.average_scores([{"scorecard": {"score": 1}}, {}])["score"], 0.5)
 
+    def test_regressions_do_not_replace_better_candidates(self):
+        best = {"fixed_code": FIXED, "grade": FAIL}
+        self.assertIs(run.keep_candidate(best, {"fixed_code": "bad", "grade": {"passed": False, "mismatches": None}}), best)
+        w = SourceWorkspace(TASK)
+        try:
+            with patch("source_workspace.grade", side_effect=[FAIL, {"passed": False, "mismatches": 8}]):
+                w.simulate()
+                w.replace_line(1, FIXED.strip())
+                outcome = w.simulate()
+                self.assertIn("rejected_trial", outcome)
+                self.assertEqual(w.code, TASK["buggy_code"])
+                self.assertEqual(w.trace()["verified_grade"], FAIL)
+        finally:
+            w.close()
+
+    def test_short_block_edits_and_original_snippets(self):
+        task = {**TASK, "buggy_code": "one\ntwo\nthree\n"}
+        w = SourceWorkspace(task)
+        try:
+            w.replace_line(1, "new one\nnew two", line_count=2)
+            self.assertEqual(w.code, "new one\nnew two\nthree\n")
+            self.assertIn("1 one", w.read_lines(1, 1000, original=True))
+            with patch("source_workspace.shutil.which", return_value=None):
+                self.assertIn("2: new two", w.search("two"))
+        finally:
+            w.close()
+
+    def test_resume_skips_qualified_tasks_and_appends_attempts(self):
+        done = {**TASK, "id": "done"}
+        previous = [{"task_id": "done", "attempt": 1, "qualified": True, "passed": True, "seconds": 1},
+                    {"task_id": TASK["id"], "attempt": 6, "qualified": False, "passed": False,
+                     "seconds": 1, "fixed_code": FIXED, "grade": FAIL}]
+        repaired = {"task_id": TASK["id"], "passed": True, "seconds": 1,
+                    "fixed_code": FIXED, "grade": PASS, "scorecard": {"score": 1}}
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(run, "load", return_value=[done, TASK]), \
+                patch.object(run, "KnowledgeBase") as kb, \
+                patch.object(run, "one", return_value=repaired) as attempt, \
+                patch.object(run, "show_attempt"), patch.object(run, "print_total"), patch.object(run, "console"):
+            kb.return_value.count.return_value = 1
+            kb.return_value.export.return_value = []
+            path = Path(tmp)
+            run.save(path / "set_a_trajectories.json", previous)
+            self.assertTrue(run.train(path, "gpt-5.5", 6, "sdk", resume=True))
+            self.assertEqual(attempt.call_count, 1)
+            self.assertEqual(attempt.call_args.args[-1], FIXED)
+            saved = json.loads((path / "set_a_trajectories.json").read_text())
+            self.assertEqual(len(saved), 3)
+            self.assertEqual(saved[-1]["attempt"], 7)
+
     def test_budget_prevents_further_edits(self):
         w = SourceWorkspace(TASK)
         try:
@@ -85,7 +135,7 @@ class PipelineTests(unittest.TestCase):
             raise exc
 
         with patch.object(agent.Runner, "run_sync", side_effect=fail_after_tools), \
-                patch("source_workspace.grade", return_value=PASS):
+                patch("source_workspace.grade", side_effect=[FAIL, PASS]):
             with self.assertRaises(RepairError) as error:
                 agent.repair(TASK, [], "", "gpt-5.5")
         trace = error.exception.trace
@@ -148,13 +198,41 @@ class PipelineTests(unittest.TestCase):
 
         with patch.dict(os.environ, {"OPENAI_API_KEY": "offline-test"}), \
                 patch.object(ChatOpenAI, "_generate", autospec=True, side_effect=respond), \
-                patch("source_workspace.grade", return_value=PASS):
+                patch("source_workspace.grade", side_effect=[FAIL, PASS]):
             answer, trace = deep_agent.repair_deep(TASK, [], "", "gpt-5.5")
         expected = {"search_source", "read_source_lines", "replace_source_line", "apply_source_patch", "simulate_fix"}
         self.assertEqual(visible_tools, [expected, expected, set()])
         self.assertEqual(answer.fixed_code, FIXED)
         self.assertEqual(trace["requests"], 3)
         self.assertEqual(trace["input_tokens"], 60)
+
+    def test_generic_initial_and_final_regression_protection(self):
+        worse = {"passed": False, "mismatches": 8, "samples": 10}
+        w = SourceWorkspace(TASK, FIXED)
+        try:
+            with patch("source_workspace.grade", side_effect=[FAIL, worse, worse]) as grader:
+                w.prepare()
+                self.assertEqual(w.code, TASK["buggy_code"])
+                w.replace_line(1, FIXED.strip())
+                w.tool_calls = TOOL_LIMIT
+                w.verify()  # Final validation still runs after the tool budget.
+                self.assertEqual(w.code, TASK["buggy_code"])
+                self.assertEqual(w.trace()["verified_grade"], FAIL)
+                self.assertEqual(grader.call_count, 3)
+        finally:
+            w.close()
+
+    def test_eval_persists_before_other_condition_finishes(self):
+        record = {"fixed_code": FIXED, "passed": True, "grade": PASS, "seconds": 0}
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(run, "load", return_value=[TASK]), \
+                patch.object(run, "KnowledgeBase"), \
+                patch.object(run, "one", side_effect=[record, RuntimeError("interrupted")]), \
+                patch.object(run, "show_attempt"), patch.object(run, "console"):
+            with self.assertRaises(RuntimeError):
+                run.evaluate(Path(tmp), "test-model", "sdk")
+            rows = json.loads((Path(tmp) / "set_b_comparison_3tries.json").read_text())
+            self.assertEqual(len(rows[0]["baseline_attempts"]), 1)
 
 
 if __name__ == "__main__":

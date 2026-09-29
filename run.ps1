@@ -5,7 +5,8 @@ param(
     [ValidateSet('sdk', 'deepagents')][string]$Backend = 'sdk',
     [int]$Attempts = 6,
     [int]$EvalAttempts = 3,
-    [ValidateSet('both', 'kb', 'baseline')][string]$EvalMode = 'both'
+    [ValidateSet('both', 'kb', 'baseline')][string]$EvalMode = 'both',
+    [switch]$Resume
 )
 
 $ErrorActionPreference = 'Stop'
@@ -16,7 +17,9 @@ if ([string]::IsNullOrWhiteSpace($env:OPENAI_API_KEY)) {
 }
 $python = Join-Path $PSScriptRoot '..\.venv\Scripts\python.exe'
 if ($Phase -eq 'train') {
-    & $python run.py --phase train --run-dir $RunDir --model $Model --backend $Backend --attempts $Attempts
+    $resumeArgs = @()
+    if ($Resume) { $resumeArgs += '--resume' }
+    & $python run.py --phase train --run-dir $RunDir --model $Model --backend $Backend --attempts $Attempts @resumeArgs
 } else {
     & $python run.py --phase eval --run-dir $RunDir --eval-mode $EvalMode --eval-attempts $EvalAttempts
 }

@@ -27,6 +27,7 @@ def review(task: dict, attempt: dict, model: str) -> tuple[Critique, dict]:
                          for number in range(max(1, start - 6), min(len(lines), end + 6) + 1))
 
     regions = changed_regions(task)
+    remaining = changed_regions({"buggy_code": attempt["fixed_code"], "correct_code": task["correct_code"]})
     prompt = json.dumps({
         "specification": task["description"],
         "changed_regions": [{
@@ -35,6 +36,11 @@ def review(task: dict, attempt: dict, model: str) -> tuple[Critique, dict]:
             "reference_snippet": snippet(reference_as_dut(task), ref_start, ref_end),
             "attempted_snippet": snippet(attempt["fixed_code"], start, end),
         } for start, end, ref_start, ref_end in regions],
+        "remaining_differences": [{
+            "candidate_lines": [start, end],
+            "candidate": snippet(attempt["fixed_code"], start, end),
+            "reference": snippet(reference_as_dut(task), ref_start, ref_end),
+        } for start, end, ref_start, ref_end in remaining],
         "attempt": {key: attempt.get(key) for key in (
             "root_cause", "bug_line", "intended_behavior", "parameters_to_check", "diagnostic_cue",
             "evidence", "fix_summary", "grade", "error")},
@@ -49,6 +55,10 @@ def review(task: dict, attempt: dict, model: str) -> tuple[Critique, dict]:
                       "from the RTL, 0.0 for an incorrect or missing explanation, "
                       "and partial credit for incomplete explanations. Check every changed "
                       "region: an explanation covering only one of multiple defects is incomplete. "
+                      "Use remaining_differences to identify mistakes introduced by the repair. "
+                      "Grade root_cause against the ORIGINAL defect; distinguish it from new mistakes. "
+                      "Give concrete corrections supported by the shown reference; do not guess "
+                      "reset or timing behavior from a signal name or mismatch alone. "
                       "The reported primary bug line may identify any real defect. Give a short "
                       "correction and a reusable diagnostic lesson with intended "
                       "behavior and concrete parameters to check. If the reported "

@@ -15,6 +15,7 @@ from deep_agent import repair_deep
 from grade import grade
 from kb import KnowledgeBase
 from scorecard import scorecard
+from source_workspace import simulation_quality
 
 ROOT = Path(__file__).resolve().parent
 console = Console(highlight=False)
@@ -124,6 +125,23 @@ def save(path: Path, obj: object) -> None:
     path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
 
 
+def keep_candidate(best: dict | None, latest: dict) -> dict | None:
+    """Never replace working progress with a worse simulator result."""
+    if latest.get("fixed_code") and (best is None or simulation_quality(latest.get("grade", {}))
+                                    >= simulation_quality(best.get("grade", {}))):
+        return latest
+    return best
+
+
+def retry_feedback(record: dict | None, training: bool = False) -> str:
+    if record is None:
+        return "No tested candidate is available; start from the original RTL."
+    feedback = f"Continuing retained attempt {record['attempt']}. Simulator: {record.get('grade', record.get('error'))}."
+    if training and record.get("critic"):
+        feedback += "\nTraining critique: " + record["critic"]["feedback"]
+    return feedback
+
+
 def one(task: dict, kb: KnowledgeBase | None, model: str, feedback: str = "", backend: str = "sdk",
         starting_code: str | None = None) -> dict:
     started = time.perf_counter()
@@ -136,6 +154,7 @@ def one(task: dict, kb: KnowledgeBase | None, model: str, feedback: str = "", ba
         record = {
             "task_id": task["id"], "category": task["category"],
             "passed": result["passed"], "grade": result,
+            "initial_grade": trace.get("initial_grade"),
             "root_cause": answer.root_cause, "fix_summary": answer.fix_summary,
             "intended_behavior": answer.intended_behavior,
             "parameters_to_check": answer.parameters_to_check,
@@ -186,7 +205,7 @@ def one(task: dict, kb: KnowledgeBase | None, model: str, feedback: str = "", ba
         return record
 
 
-def train(run_dir: Path, model: str, attempts: int, backend: str) -> bool:
+def train(run_dir: Path, model: str, attempts: int, backend: str, resume: bool = False) -> bool:
     # Run KB starts empty; successful lessons also update the persistent master.
     kb = KnowledgeBase(run_dir / "kb")
     master = KnowledgeBase(ROOT / "results" / "master_kb")
@@ -195,15 +214,26 @@ def train(run_dir: Path, model: str, attempts: int, backend: str) -> bool:
     console.print(f"Tasks: {len(tasks)}   Data: data/set_a.json")
     console.print("Gate: simulation pass AND score > 0.80. Provisional lessons update only the run KB.")
     console.print(f"Run KB: {run_dir / 'kb'}   Master entries: {master.count()}")
-    records = []
+    records = json.loads((run_dir / "set_a_trajectories.json").read_text(encoding="utf-8")) if resume else []
     for index, task in enumerate(tasks, 1):
-        feedback = ""
-        candidate = None
-        best_quality = (-1, -1, -1.0)
-        for attempt in range(1, attempts + 1):
+        previous = [r for r in records if r["task_id"] == task["id"]]
+        if any(r.get("qualified") for r in previous):
+            console.print(f"A {index:02d}/{len(tasks):02d} {task['id']}  skipped (already qualified)")
+            continue
+        best_candidate = None
+        for old in previous:
+            best_candidate = keep_candidate(best_candidate, old)
+        candidate = best_candidate.get("fixed_code") if best_candidate else None
+        feedback = retry_feedback(best_candidate, training=True) if previous else ""
+        best_quality = max((
+            (int(r.get("qualified", False)), *simulation_quality(r.get("grade", {})),
+             r.get("scorecard", {}).get("score", 0)) for r in previous), default=(-1,))
+        offset = max((r["attempt"] for r in previous), default=0)
+        for attempt in range(offset + 1, offset + attempts + 1):
             record = one(task, kb, model, feedback, backend, candidate)
-            candidate = record.get("fixed_code", candidate)
             record["attempt"] = attempt
+            best_candidate = keep_candidate(best_candidate, record)
+            candidate = best_candidate.get("fixed_code") if best_candidate else None
             score = record.get("scorecard", {}).get("score", 0.0)
             record["qualified"] = record["passed"] and score > 0.8
 
@@ -213,7 +243,7 @@ def train(run_dir: Path, model: str, attempts: int, backend: str) -> bool:
 
             # Prefer qualified, then simulator-passing, then higher-scoring
             # lessons. A passing repair must outrank a failed simulation.
-            quality = (int(record["qualified"]), int(record["passed"]), score)
+            quality = (int(record["qualified"]), *simulation_quality(record.get("grade", {})), score)
             record["run_kb_action"] = "skipped (no better lesson)"
             record["master_kb_action"] = "skipped (not qualified)"
             if quality > best_quality and (record["qualified"] or critique is not None):
@@ -232,8 +262,7 @@ def train(run_dir: Path, model: str, attempts: int, backend: str) -> bool:
             show_attempt("A", index, len(tasks), task, record, attempt=attempt)
             if record["qualified"]:
                 break
-            feedback = (critique["feedback"] if critique else
-                        f"Simulator result: {record.get('grade', record.get('error'))}.")
+            feedback = retry_feedback(best_candidate, training=True)
     latest = {task["id"]: next((r for r in reversed(records) if r["task_id"] == task["id"]), None)
               for task in tasks}
     passed = sum(bool(r and r["qualified"]) for r in latest.values())
@@ -242,7 +271,8 @@ def train(run_dir: Path, model: str, attempts: int, backend: str) -> bool:
                "qualification_rule": "sim_pass_and_score_gt_0.8",
                "scorer_version": SCORER_VERSION,
                "kb_entries": kb.count(), "master_kb_entries": master.count(),
-               "model": model, "backend": backend, "attempt_limit": attempts,
+               "model": model, "backend": backend, "attempts_per_invocation": attempts,
+               "attempt_limit": max(r["attempt"] for r in records),
                "evaluation_unlocked": passed == len(latest), **totals(records),
                "scored_tasks": sum(bool(r and r.get("scorecard")) for r in latest.values()),
                "scorecard_average": average_scores([r for r in latest.values() if r])}
@@ -266,28 +296,34 @@ def evaluate(run_dir: Path, model: str, backend: str, mode: str = "both",
     comparisons = []
     for index, task in enumerate(tasks, 1):
         pair = {"task_id": task["id"]}
+        comparisons.append(pair)
         for label, active_kb in (("baseline", None), ("with_kb", kb)):
             if mode != "both" and mode != ("kb" if active_kb else "baseline"):
                 continue
             attempts = []
             feedback = ""
             candidate = None
+            best_candidate = None
             for attempt in range(1, max_attempts + 1):
                 record = one(task, active_kb, model, feedback, backend, candidate)
-                candidate = record.get("fixed_code", candidate)
                 record["attempt"] = attempt
+                best_candidate = keep_candidate(best_candidate, record)
+                candidate = best_candidate.get("fixed_code") if best_candidate else None
                 record["run_kb_action"] = ("frozen (read only)" if active_kb
                                            else "not used (baseline)")
                 record["master_kb_action"] = "not updated (evaluation)"
                 attempts.append(record)
+                # Persist each attempt, even if the other condition is interrupted.
+                pair[label] = best_candidate or record
+                pair[f"{label}_attempts"] = attempts
+                save(run_dir / f"{name}.json", comparisons)
                 show_attempt("B", index, len(tasks), task, record,
                              condition=f"{label} try {attempt}")
                 if record["passed"]:
                     break
-                feedback = f"Previous simulator failure: {record.get('grade', record.get('error'))}."
-            pair[label] = attempts[-1]
+                feedback = retry_feedback(best_candidate)
+            pair[label] = best_candidate or attempts[-1]
             pair[f"{label}_attempts"] = attempts
-        comparisons.append(pair)
         save(run_dir / f"{name}.json", comparisons)
     summary = {}
     for label in ("baseline", "with_kb"):
@@ -317,6 +353,7 @@ def main() -> None:
     parser.add_argument("--eval-attempts", type=int, default=3)
     parser.add_argument("--backend", choices=["sdk", "deepagents"])
     parser.add_argument("--run-dir", type=Path)
+    parser.add_argument("--resume", action="store_true", help="Continue unfinished set A tasks with an additional attempt budget")
     args = parser.parse_args()
     if args.attempts < 1 or args.eval_attempts < 1:
         parser.error("Attempt limits must be at least 1")
@@ -329,7 +366,8 @@ def main() -> None:
     if args.phase == "eval":
         summary_path = run_dir / "set_a_summary.json"
         if not summary_path.exists():
-            parser.error(f"No completed set A training in {run_dir}")
+            hint = "Resume training with make train RESUME=true" if (run_dir / "set_a_trajectories.json").exists() else "Run make train first"
+            parser.error(f"No completed set A training in {run_dir}. {hint} using the same RUN_DIR.")
         training = json.loads(summary_path.read_text(encoding="utf-8"))
         if training.get("qualification_rule") != "sim_pass_and_score_gt_0.8":
             parser.error("Training used an older pass rule; train a fresh run before evaluation")
@@ -343,17 +381,24 @@ def main() -> None:
             parser.error("Evaluation model and backend must match set A training")
         evaluate(run_dir, model, backend, args.eval_mode, args.eval_attempts)
         return
-    if (run_dir / "set_a_summary.json").exists():
+    if (run_dir / "set_a_summary.json").exists() and not args.resume:
         parser.error(f"Training already exists in {run_dir}; choose another --run-dir")
-    if (run_dir / "set_a_trajectories.json").exists() or (run_dir / "kb").exists():
-        parser.error(f"Partial training exists in {run_dir}; choose a fresh --run-dir")
+    if not args.resume and ((run_dir / "set_a_trajectories.json").exists() or (run_dir / "kb").exists()):
+        parser.error(f"Partial training exists in {run_dir}; use make train RESUME=true to continue, or choose a fresh RUN_DIR")
     run_dir.mkdir(parents=True, exist_ok=True)
     model = args.model or "gpt-5.5"
     backend = args.backend or "sdk"
-    save(run_dir / "config.json", {"model": model, "attempts": args.attempts,
+    if args.resume:
+        if not (run_dir / "set_a_trajectories.json").exists() or not (run_dir / "config.json").exists():
+            parser.error("No saved training attempts to resume")
+        config = json.loads((run_dir / "config.json").read_text(encoding="utf-8"))
+        if (model, backend) != (config["model"], config["backend"]):
+            parser.error("Resume must use the original training model and backend")
+    else:
+        save(run_dir / "config.json", {"model": model, "attempts": args.attempts,
                                    "backend": backend,
                                    "set_a": "data/set_a.json", "set_b": "data/set_b.json"})
-    unlocked = train(run_dir, model, args.attempts, backend)
+    unlocked = train(run_dir, model, args.attempts, backend, resume=args.resume)
     if args.phase == "all":
         if unlocked:
             evaluate(run_dir, model, backend, args.eval_mode, args.eval_attempts)

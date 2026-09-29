@@ -6,6 +6,7 @@ from langchain.agents.middleware import wrap_model_call
 from langchain_core.callbacks import UsageMetadataCallbackHandler
 from langchain_core.tools import tool
 from langgraph.errors import GraphRecursionError
+import json
 
 from agent import Repair, RepairReport, SYSTEM, build_prompt
 from source_workspace import RepairError, SourceWorkspace, TOOL_LIMIT
@@ -48,9 +49,9 @@ def repair_deep(task: dict, hints: list[dict], feedback: str, model: str,
         return workspace.search(pattern)
 
     @tool
-    def read_source_lines(start: int, end: int) -> str:
-        """Read at most 40 numbered source lines, inclusive."""
-        return workspace.read_lines(start, end)
+    def read_source_lines(start: int, end: int, original: bool = False) -> str:
+        """Read up to 40 numbered lines. original=True reads the original buggy RTL."""
+        return workspace.read_lines(start, end, original)
 
     @tool
     def apply_source_patch(patch: str) -> str:
@@ -58,9 +59,9 @@ def repair_deep(task: dict, hints: list[dict], feedback: str, model: str,
         return workspace.apply_patch(patch)
 
     @tool
-    def replace_source_line(line_number: int, new_line: str) -> str:
-        """Replace one numbered source line with the complete corrected line."""
-        return workspace.replace_line(line_number, new_line)
+    def replace_source_line(line_number: int, new_line: str, line_count: int = 1) -> str:
+        """Replace line_count existing lines with new_line text; each is capped at 40 lines."""
+        return workspace.replace_line(line_number, new_line, line_count)
 
     @tool
     def simulate_fix() -> dict:
@@ -68,6 +69,8 @@ def repair_deep(task: dict, hints: list[dict], feedback: str, model: str,
         return workspace.simulate()
 
     try:
+        initial = workspace.prepare()
+        prompt += "\nStarting candidate simulator result: " + json.dumps(initial)
         # Keep the Deep Agents loop, exposing only the five RTL tools.
         register_harness_profile(f"openai:{model}", HarnessProfile(
             general_purpose_subagent=GeneralPurposeSubagentProfile(enabled=False),
@@ -80,8 +83,7 @@ def repair_deep(task: dict, hints: list[dict], feedback: str, model: str,
             middleware=[tool_budget], response_format=RepairReport)
         result = agent.invoke({"messages": [{"role": "user", "content": prompt}]},
                               config={"recursion_limit": 6 * (TOOL_LIMIT + 2), "callbacks": [usage]})
-        if workspace.code == task["buggy_code"]:
-            raise RuntimeError("Fixer identified a bug but did not edit dut.sv")
+        workspace.verify()
         answer = Repair(**result["structured_response"].model_dump(), fixed_code=workspace.code)
         return answer, {
             **workspace.trace(), **usage.counts(), "prompt": prompt,

@@ -33,7 +33,9 @@ return your report with the evidence available. Do not repeat unchanged reads.
 Fix dut.sv before returning a repair report, unless the carried-over repair
 already passes and only its explanation needs correction. For a one-line defect,
 call replace_source_line(line_number, new_line) with the complete corrected line.
-For multiple lines, call apply_source_patch with a unified diff using only
+For a short block, set line_count to the number of existing lines to replace
+and new_line to the complete replacement text. Prefer this to several single-line
+calls. For a larger patch, call apply_source_patch with a unified diff using only
 dut.sv and headers --- a/dut.sv and +++ b/dut.sv. Call simulate_fix after editing,
 then revise based on simulator feedback if needed. If simulation passes, stop
 using tools and return the repair report immediately. Pay particular attention to
@@ -56,6 +58,8 @@ Use replace_source_line(line_number, new_line) for one-line changes or
 apply_source_patch(patch) for a multi-line change, then simulate_fix().
 The source may contain the previous attempt's repair. Feedback describes that
 candidate. Continue from it. Report bug_line in the original source numbering.
+Use read_source_lines(original=True) to check the ORIGINAL defect when explaining
+root cause. Correct only evidenced defects; avoid redesigning other logic.
 \nRelevant RCA lessons:\n{lesson_block}
 \nPrevious attempt feedback:\n{feedback or '(first attempt)'}
 """
@@ -80,9 +84,9 @@ def repair(task: dict, hints: list[dict], feedback: str, model: str,
         return workspace.search(pattern)
 
     @function_tool(is_enabled=enabled)
-    def read_source_lines(start: int, end: int) -> str:
-        """Read a numbered source snippet of at most 40 lines, inclusive."""
-        return workspace.read_lines(start, end)
+    def read_source_lines(start: int, end: int, original: bool = False) -> str:
+        """Read up to 40 numbered lines. original=True reads the original buggy RTL."""
+        return workspace.read_lines(start, end, original)
 
     @function_tool(is_enabled=enabled)
     def apply_source_patch(patch: str) -> str:
@@ -90,9 +94,9 @@ def repair(task: dict, hints: list[dict], feedback: str, model: str,
         return workspace.apply_patch(patch)
 
     @function_tool(is_enabled=enabled)
-    def replace_source_line(line_number: int, new_line: str) -> str:
-        """Replace one numbered source line with the complete corrected line."""
-        return workspace.replace_line(line_number, new_line)
+    def replace_source_line(line_number: int, new_line: str, line_count: int = 1) -> str:
+        """Replace line_count existing lines with new_line text; each is capped at 40 lines."""
+        return workspace.replace_line(line_number, new_line, line_count)
 
     @function_tool(is_enabled=enabled)
     def simulate_fix() -> str:
@@ -106,10 +110,11 @@ def repair(task: dict, hints: list[dict], feedback: str, model: str,
                   output_type=RepairReport)
     result = None
     try:
+        initial = workspace.prepare()
+        prompt += "\nStarting candidate simulator result: " + json.dumps(initial)
         # Reserve a final reporting turn after the tool budget is exhausted.
         result = Runner.run_sync(agent, prompt, max_turns=TOOL_LIMIT + 2)
-        if workspace.code == task["buggy_code"]:
-            raise RuntimeError("Fixer identified a bug but did not edit dut.sv")
+        workspace.verify()
         return Repair(**result.final_output.model_dump(), fixed_code=workspace.code), {
             **workspace.trace(), **usage_counts(result.context_wrapper.usage), "prompt": prompt,
         }

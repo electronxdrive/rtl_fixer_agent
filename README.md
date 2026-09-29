@@ -19,6 +19,8 @@ cd C:\Users\srira\Documents\chip_agents\rtlx_fixer_agent
 $env:OPENAI_API_KEY = [Environment]::GetEnvironmentVariable('OPENAI_API_KEY', 'User')
 & ..\.venv\Scripts\python.exe build_dataset.py
 make train
+# Continue interrupted/unqualified training without repeating qualified tasks:
+make train RESUME=true
 make eval
 # Or evaluate only with the frozen KB:
 make eval KB=true
@@ -35,5 +37,7 @@ The selected `data/set_a.json` and `data/set_b.json` files contain ChipBench pro
 The three scorecard values are diagnostics from the reference source and patch, not the pass criterion. Estimated model cost uses [published GPT-5.5 standard API rates](https://developers.openai.com/api/docs/models/gpt-5.5) and reported cached tokens. Embedding charges from Chroma retrieval are excluded. Runs with an API error may have unmeasured tokens and cost; stdout reports the count of such runs.
 
 Score averages use every task, counting unscored tasks as zero and displaying score coverage. Interrupted agents retain their candidate, tool history, current simulation result, and available SDK/callback usage. Missing API usage remains explicitly marked incomplete. Set B retries carry only their own condition's candidate and simulator feedback; they never receive reference-aware critic feedback.
+
+`make train RESUME=true` loads saved attempts and the existing run KB, skips qualified tasks, and grants up to `ATTEMPTS` additional tries per unfinished task. Attempt numbers and totals include earlier work. Evaluation stays locked until every set A task qualifies. The critic reviews remaining candidate/reference differences as well as original defects, so feedback can identify mistakes introduced by a repair. Tested regressions are rolled back, and outer retries retain the candidate with the best simulator result. Short edits can replace up to 40 lines in one call; source reads can explicitly inspect the original buggy RTL for root-cause attribution.
 
 Source: [ChipBench](https://github.com/zhongkaiyu/ChipBench), MIT license copied to `data/CHIPBENCH_LICENSE.txt`. The HWE-Bench source snapshot is available beside this project but is not used in this experiment.
