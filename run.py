@@ -133,11 +133,22 @@ def keep_candidate(best: dict | None, latest: dict) -> dict | None:
     return best
 
 
-def retry_feedback(record: dict | None, training: bool = False) -> str:
+def retry_feedback(record: dict | None, training: bool = False, latest: dict | None = None) -> str:
+    latest = latest if latest is not None else record
     if record is None:
-        return "No tested candidate is available; start from the original RTL."
-    feedback = f"Continuing retained attempt {record['attempt']}. Simulator: {record.get('grade', record.get('error'))}."
-    if training and record.get("critic"):
+        feedback = "No tested candidate is available; start from the original RTL."
+    else:
+        feedback = f"Continuing retained attempt {record['attempt']}. Simulator: {record.get('grade', record.get('error'))}."
+    if latest is None:
+        return feedback
+    if latest.get("error"):
+        feedback += "\nLatest attempt error: " + latest["error"]
+    trials = latest.get("simulations", [])
+    if trials and (record is None or trials[-1] != record.get("grade")):
+        feedback += ("\nLast rejected edit's simulator result: " + str(trials[-1])
+                     + "\nThat edit was reverted. These errors describe the rejected edit, not the retained RTL. "
+                       "Avoid repeating that change; inspect the retained source before a smaller repair.")
+    if training and record and record.get("critic"):
         feedback += "\nTraining critique: " + record["critic"]["feedback"]
     return feedback
 
@@ -224,7 +235,7 @@ def train(run_dir: Path, model: str, attempts: int, backend: str, resume: bool =
         for old in previous:
             best_candidate = keep_candidate(best_candidate, old)
         candidate = best_candidate.get("fixed_code") if best_candidate else None
-        feedback = retry_feedback(best_candidate, training=True) if previous else ""
+        feedback = retry_feedback(best_candidate, training=True, latest=previous[-1]) if previous else ""
         best_quality = max((
             (int(r.get("qualified", False)), *simulation_quality(r.get("grade", {})),
              r.get("scorecard", {}).get("score", 0)) for r in previous), default=(-1,))
@@ -262,7 +273,7 @@ def train(run_dir: Path, model: str, attempts: int, backend: str, resume: bool =
             show_attempt("A", index, len(tasks), task, record, attempt=attempt)
             if record["qualified"]:
                 break
-            feedback = retry_feedback(best_candidate, training=True)
+            feedback = retry_feedback(best_candidate, training=True, latest=record)
     latest = {task["id"]: next((r for r in reversed(records) if r["task_id"] == task["id"]), None)
               for task in tasks}
     passed = sum(bool(r and r["qualified"]) for r in latest.values())
@@ -321,7 +332,7 @@ def evaluate(run_dir: Path, model: str, backend: str, mode: str = "both",
                              condition=f"{label} try {attempt}")
                 if record["passed"]:
                     break
-                feedback = retry_feedback(best_candidate)
+                feedback = retry_feedback(best_candidate, latest=record)
             pair[label] = best_candidate or attempts[-1]
             pair[f"{label}_attempts"] = attempts
         save(run_dir / f"{name}.json", comparisons)

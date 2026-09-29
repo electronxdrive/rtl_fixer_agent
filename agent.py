@@ -30,6 +30,15 @@ Aim for at most four searches/reads before the first edit and at most three
 simulations. The hard budget is 12 tool calls and 3 simulation calls per attempt.
 Tools are disabled after a passing simulation or an exhausted budget; then
 return your report with the evidence available. Do not repeat unchanged reads.
+Do not scan the whole file and then read the same original source again.
+Original snippets are needed only where prior edits changed the relevant lines.
+Prefer the smallest evidenced correction to a rewrite. Preserve unrelated logic.
+Reserve calls for simulate_fix: test your first repair before spending the last
+two tool calls. Near the limit, only simulate_fix is available until pending
+edits are tested; the last tool call is reserved for simulation.
+If an edit is rejected, correct the tool arguments rather than
+repeatedly submitting an oversized replacement. Report only changes actually
+present in the retained source, not an intended rewrite that was never completed.
 Fix dut.sv before returning a repair report, unless the carried-over repair
 already passes and only its explanation needs correction. For a one-line defect,
 call replace_source_line(line_number, new_line) with the complete corrected line.
@@ -58,8 +67,9 @@ Use replace_source_line(line_number, new_line) for one-line changes or
 apply_source_patch(patch) for a multi-line change, then simulate_fix().
 The source may contain the previous attempt's repair. Feedback describes that
 candidate. Continue from it. Report bug_line in the original source numbering.
-Use read_source_lines(original=True) to check the ORIGINAL defect when explaining
-root cause. Correct only evidenced defects; avoid redesigning other logic.
+Only read original=True snippets if the relevant lines have changed and you need
+the original defect's line number. Do not reread unchanged original snippets.
+Correct only evidenced defects; avoid redesigning other logic.
 \nRelevant RCA lessons:\n{lesson_block}
 \nPrevious attempt feedback:\n{feedback or '(first attempt)'}
 """
@@ -76,7 +86,7 @@ def repair(task: dict, hints: list[dict], feedback: str, model: str,
            starting_code: str | None = None) -> tuple[Repair, dict]:
     prompt = build_prompt(task, hints, feedback)
     workspace = SourceWorkspace(task, starting_code)
-    enabled = lambda context, agent: workspace.tools_available
+    enabled = lambda context, agent: workspace.tool_enabled("read")
 
     @function_tool(is_enabled=enabled)
     def search_source(pattern: str) -> str:
@@ -98,7 +108,7 @@ def repair(task: dict, hints: list[dict], feedback: str, model: str,
         """Replace line_count existing lines with new_line text; each is capped at 40 lines."""
         return workspace.replace_line(line_number, new_line, line_count)
 
-    @function_tool(is_enabled=enabled)
+    @function_tool(is_enabled=lambda context, agent: workspace.tool_enabled("simulate"))
     def simulate_fix() -> str:
         """Compile and run the current dut.sv against the supplied testbench."""
         return json.dumps(workspace.simulate())
@@ -114,7 +124,7 @@ def repair(task: dict, hints: list[dict], feedback: str, model: str,
         prompt += "\nStarting candidate simulator result: " + json.dumps(initial)
         # Reserve a final reporting turn after the tool budget is exhausted.
         result = Runner.run_sync(agent, prompt, max_turns=TOOL_LIMIT + 2)
-        workspace.verify()
+        workspace.finish()
         return Repair(**result.final_output.model_dump(), fixed_code=workspace.code), {
             **workspace.trace(), **usage_counts(result.context_wrapper.usage), "prompt": prompt,
         }

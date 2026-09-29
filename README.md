@@ -41,3 +41,9 @@ Score averages use every task, counting unscored tasks as zero and displaying sc
 `make train RESUME=true` loads saved attempts and the existing run KB, skips qualified tasks, and grants up to `ATTEMPTS` additional tries per unfinished task. Attempt numbers and totals include earlier work. Evaluation stays locked until every set A task qualifies. The critic reviews remaining candidate/reference differences as well as original defects, so feedback can identify mistakes introduced by a repair. Tested regressions are rolled back, and outer retries retain the candidate with the best simulator result. Short edits can replace up to 40 lines in one call; source reads can explicitly inspect the original buggy RTL for root-cause attribution.
 
 Source: [ChipBench](https://github.com/zhongkaiyu/ChipBench), MIT license copied to `data/CHIPBENCH_LICENSE.txt`. The HWE-Bench source snapshot is available beside this project but is not used in this experiment.
+
+## Shared tool and feedback flow
+
+Both backends use the same source workspace and five tools. The runner grades the original RTL before repairs, validates the final candidate, and retains the best tested source. These runner checks are separate from the agent's 12-tool / 3-simulation-call budget. The final tool slot is reserved for simulation; pending edits also force simulation when only two slots remain.
+
+Retries receive the retained source's simulator result plus the latest rejected edit's errors, explicitly labeled as belonging to reverted code. Only training receives critic feedback. If final validation reverts an edit after the agent wrote its report, that stale report is discarded and the attempt is recorded with its tested candidate and error. Evaluation saves each attempt immediately. Patch and block-edit rejection messages are retained in tool history.

@@ -47,11 +47,31 @@ class SourceWorkspace:
 
     def take_call(self, name: str) -> bool:
         """Enforce one shared budget for either backend, including invalid calls."""
-        if not self.tools_available:
+        if not self.tool_enabled(name):
             return False
         self.tool_calls += 1
         self.history.append(f"tool {self.tool_calls}/{TOOL_LIMIT}: {name}")
         return True
+
+    def tool_enabled(self, name: str) -> bool:
+        """Reserve the last call for simulation; test pending edits near the limit."""
+        if not self.tools_available:
+            return False
+        if name in ("simulate", "simulate_fix"):
+            return True
+        return self.tool_calls < TOOL_LIMIT - 1 and not (
+            self.tool_calls >= TOOL_LIMIT - 2 and self.code != self.last_simulated_code)
+
+    def finish(self) -> None:
+        """Never attach a report about rejected edits to the restored source."""
+        reported_code = self.code
+        self.verify()
+        if self.code != reported_code:
+            raise RuntimeError("Final edit failed validation and was reverted; repair report discarded")
+
+    def reject(self, message: str) -> str:
+        self.history.append(message)
+        return message
 
     def trace(self) -> dict:
         # On an interrupted run, keep tested progress instead of an untested edit.
@@ -113,21 +133,21 @@ class SourceWorkspace:
         if not self.take_call("patch"):
             return "Tools finished. Return the repair report."
         if not shutil.which("git"):
-            return "Git is unavailable. Use replace_source_line with line_count for this block."
+            return self.reject("Git is unavailable. Use replace_source_line with line_count for this block.")
         headers = [line for line in patch.splitlines() if line.startswith(("--- ", "+++ "))]
         if headers != ["--- a/dut.sv", "+++ b/dut.sv"]:
-            return "Patch must edit only dut.sv with headers --- a/dut.sv and +++ b/dut.sv."
+            return self.reject("Patch must edit only dut.sv with headers --- a/dut.sv and +++ b/dut.sv.")
         check = subprocess.run(["git", "apply", "--recount", "--check", "--include=dut.sv", "-"], input=patch,
                                cwd=self.path.parent, capture_output=True, text=True, timeout=10)
         if check.returncode:
             self.history.append("patch rejected")
-            return f"Patch rejected: {check.stderr[-1000:]}"
+            return self.reject(f"Patch rejected: {check.stderr[-1000:]}")
         before = self.code
         result = subprocess.run(["git", "apply", "--recount", "--include=dut.sv", "-"], input=patch,
                                 cwd=self.path.parent, capture_output=True, text=True, timeout=10)
         if result.returncode:
             self.history.append("patch failed")
-            return f"Patch failed: {result.stderr[-1000:]}"
+            return self.reject(f"Patch failed: {result.stderr[-1000:]}")
         self.edits += self.code != before
         self.history.append("patch applied" if self.code != before else "patch made no change")
         return "Patch applied." if self.code != before else "Patch made no change."
@@ -140,7 +160,7 @@ class SourceWorkspace:
         replacement_lines = new_line.splitlines()
         if (line_number < 1 or not 1 <= line_count <= 40 or line_number + line_count - 1 > len(lines)
                 or len(replacement_lines) > 40):
-            return "Choose an existing range and replacement of at most 40 lines."
+            return self.reject("Choose an existing range and replacement of at most 40 lines.")
         original = "".join(lines[line_number - 1:line_number - 1 + line_count])
         replacement = "\n".join(replacement_lines) + ("\n" if original.endswith("\n") and replacement_lines else "")
         if replacement == original:

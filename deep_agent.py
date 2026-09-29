@@ -40,7 +40,7 @@ def repair_deep(task: dict, hints: list[dict], feedback: str, model: str,
         if usage.requests >= TOOL_LIMIT + 2:
             raise RuntimeError("Model request budget exhausted")
         return handler(request.override(
-            tools=request.tools if workspace.tools_available else [],
+            tools=[t for t in request.tools if workspace.tool_enabled(t.name)],
             model_settings={**request.model_settings, "parallel_tool_calls": False}))
 
     @tool
@@ -83,7 +83,7 @@ def repair_deep(task: dict, hints: list[dict], feedback: str, model: str,
             middleware=[tool_budget], response_format=RepairReport)
         result = agent.invoke({"messages": [{"role": "user", "content": prompt}]},
                               config={"recursion_limit": 6 * (TOOL_LIMIT + 2), "callbacks": [usage]})
-        workspace.verify()
+        workspace.finish()
         answer = Repair(**result["structured_response"].model_dump(), fixed_code=workspace.code)
         return answer, {
             **workspace.trace(), **usage.counts(), "prompt": prompt,

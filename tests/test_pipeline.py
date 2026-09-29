@@ -41,6 +41,15 @@ class PipelineTests(unittest.TestCase):
     def test_unscored_tasks_are_not_dropped(self):
         self.assertEqual(run.average_scores([{"scorecard": {"score": 1}}, {}])["score"], 0.5)
 
+    def test_retry_includes_rejected_simulator_error_without_critic(self):
+        record = {"attempt": 1, "grade": FAIL,
+                  "simulations": [{"passed": False, "error": "dut.sv:41: syntax error"}],
+                  "critic": {"feedback": "hidden reference guidance"}}
+        feedback = run.retry_feedback(record)
+        self.assertIn("dut.sv:41: syntax error", feedback)
+        self.assertIn("edit was reverted", feedback)
+        self.assertNotIn("hidden reference guidance", feedback)
+
     def test_regressions_do_not_replace_better_candidates(self):
         best = {"fixed_code": FIXED, "grade": FAIL}
         self.assertIs(run.keep_candidate(best, {"fixed_code": "bad", "grade": {"passed": False, "mismatches": None}}), best)
@@ -94,8 +103,13 @@ class PipelineTests(unittest.TestCase):
     def test_budget_prevents_further_edits(self):
         w = SourceWorkspace(TASK)
         try:
+            with patch("source_workspace.grade", return_value=FAIL):
+                w.prepare()
             for _ in range(TOOL_LIMIT):
                 w.read_lines(1, 1)
+            self.assertFalse(w.tool_enabled("read"))
+            with patch("source_workspace.grade", return_value=FAIL):
+                w.simulate()  # The final call is reserved for validation.
             self.assertFalse(w.tools_available)
             w.replace_line(1, FIXED.strip())
             self.assertEqual(w.code, TASK["buggy_code"])
@@ -233,6 +247,44 @@ class PipelineTests(unittest.TestCase):
                 run.evaluate(Path(tmp), "test-model", "sdk")
             rows = json.loads((Path(tmp) / "set_b_comparison_3tries.json").read_text())
             self.assertEqual(len(rows[0]["baseline_attempts"]), 1)
+
+    def test_pending_edits_reserve_simulation_for_both_backends(self):
+        w = SourceWorkspace(TASK)
+        try:
+            with patch("source_workspace.grade", side_effect=[FAIL, PASS]):
+                w.prepare()
+                w.replace_line(1, FIXED.strip())
+                w.tool_calls = TOOL_LIMIT - 2
+                self.assertFalse(w.tool_enabled("read_source_lines"))
+                self.assertFalse(w.tool_enabled("replace_source_line"))
+                self.assertTrue(w.tool_enabled("simulate_fix"))
+                w.simulate()
+                self.assertFalse(w.tools_available)
+        finally:
+            w.close()
+
+    def test_final_rollback_discards_stale_report(self):
+        w = SourceWorkspace(TASK)
+        try:
+            with patch("source_workspace.grade", side_effect=[FAIL, {"passed": False, "mismatches": None}]):
+                w.prepare()
+                w.replace_line(1, FIXED.strip())
+                with self.assertRaisesRegex(RuntimeError, "report discarded"):
+                    w.finish()
+                self.assertEqual(w.trace()["fixed_code"], TASK["buggy_code"])
+                self.assertEqual(w.trace()["verified_grade"], FAIL)
+        finally:
+            w.close()
+
+    def test_latest_errors_survive_retaining_older_candidate(self):
+        best = {"attempt": 1, "grade": FAIL}
+        latest = {"attempt": 2, "error": "agent stopped", "simulations": [
+            {"passed": False, "error": "syntax error"}], "critic": {"feedback": "private reference"}}
+        feedback = run.retry_feedback(best, latest=latest)
+        self.assertIn("retained attempt 1", feedback)
+        self.assertIn("agent stopped", feedback)
+        self.assertIn("syntax error", feedback)
+        self.assertNotIn("private reference", feedback)
 
 
 if __name__ == "__main__":
